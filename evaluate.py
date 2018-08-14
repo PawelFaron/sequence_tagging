@@ -81,7 +81,7 @@ def main():
 
     # evaluate and interact
     model.evaluate(test)
-    interactive_shell(model)
+    #interactive_shell(model)
 
 
 if __name__ == "__main__":

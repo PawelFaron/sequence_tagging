@@ -1,9 +1,12 @@
+import os
+
 from model.data_utils import CoNLLDataset
 from model.ner_model import NERModel
 from model.config import Config
 
 
 def main():
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
     # create instance of config
     config = Config()
 

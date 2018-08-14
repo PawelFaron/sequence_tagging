@@ -1,6 +1,7 @@
+import itertools
 import os
 import tensorflow as tf
-
+import sklearn
 
 class BaseModel(object):
     """Generic class for general methods that are not specific to NER"""
@@ -26,36 +27,37 @@ class BaseModel(object):
         self.sess.run(init)
 
 
-    def add_train_op(self, lr_method, lr, loss, clip=-1):
+    def add_train_op(self, lr_method, loss, clip=-1):
         """Defines self.train_op that performs an update on a batch
 
         Args:
             lr_method: (string) sgd method, for example "adam"
-            lr: (tf.placeholder) tf.float32, learning rate
             loss: (tensor) tf.float32 loss to minimize
             clip: (python float) clipping of gradient. If < 0, no clipping
 
         """
         _lr_m = lr_method.lower() # lower to make sure
-
+        global_step = tf.train.create_global_step()
         with tf.variable_scope("train_step"):
+            self.learning_rate = tf.train.exponential_decay(self.config.lr, global_step, 1000, self.config.lr_decay)
+            #self.learning_rate = tf.train.cosine_decay_restarts(self.config.lr, global_step, 1000)
             if _lr_m == 'adam': # sgd method
-                optimizer = tf.train.AdamOptimizer(lr)
+                optimizer = tf.train.AdamOptimizer(self.learning_rate)
             elif _lr_m == 'adagrad':
-                optimizer = tf.train.AdagradOptimizer(lr)
+                optimizer = tf.train.AdagradOptimizer(self.learning_rate)
             elif _lr_m == 'sgd':
-                optimizer = tf.train.GradientDescentOptimizer(lr)
+                optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
             elif _lr_m == 'rmsprop':
-                optimizer = tf.train.RMSPropOptimizer(lr)
+                optimizer = tf.train.RMSPropOptimizer(self.learning_rate)
             else:
                 raise NotImplementedError("Unknown method {}".format(_lr_m))
 
             if clip > 0: # gradient clipping if clip is positive
-                grads, vs     = zip(*optimizer.compute_gradients(loss))
-                grads, gnorm  = tf.clip_by_global_norm(grads, clip)
-                self.train_op = optimizer.apply_gradients(zip(grads, vs))
+                gradients, variables = zip(*optimizer.compute_gradients(loss))
+                gradients, gnorm  = tf.clip_by_global_norm(gradients, clip)
+                self.train_op = optimizer.apply_gradients(zip(gradients, variables), global_step=global_step)
             else:
-                self.train_op = optimizer.minimize(loss)
+                self.train_op = optimizer.minimize(loss=loss, global_step=global_step)
 
 
     def initialize_session(self):
@@ -103,23 +105,18 @@ class BaseModel(object):
 
 
     def train(self, train, dev):
-        """Performs training with early stopping and lr exponential decay
-
-        Args:
-            train: dataset that yields tuple of (sentences, tags)
-            dev: dataset
-
-        """
         best_score = 0
         nepoch_no_imprv = 0 # for early stopping
         self.add_summary() # tensorboard
 
+        (Z, X, Y) = train.get_train_data()
         for epoch in range(self.config.nepochs):
             self.logger.info("Epoch {:} out of {:}".format(epoch + 1,
                         self.config.nepochs))
 
+            (Z, X, Y) = sklearn.utils.shuffle(Z, X, Y)
+            train = list(zip(Z, X, Y))
             score = self.run_epoch(train, dev, epoch)
-            self.config.lr *= self.config.lr_decay # decay learning rate
 
             # early stopping and saving best parameters
             if score >= best_score:

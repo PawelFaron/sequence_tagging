@@ -54,7 +54,6 @@ class Config():
         self.embeddings = (get_trimmed_glove_vectors(self.filename_trimmed)
                 if self.use_pretrained else None)
 
-
     # general config
     dir_output = "results/test/"
     dir_model  = dir_output + "model.weights/"
@@ -65,17 +64,20 @@ class Config():
     dim_char = 100
 
     # glove files
-    filename_glove = "data/glove.6B/glove.6B.{}d.txt".format(dim_word)
+    filename_glove = "D:\\glove.840B.300d.txt"
+    #filename_glove = "D:\\wiki.de.vec"
     # trimmed embeddings (created from glove_filename with build_data.py)
     filename_trimmed = "data/glove.6B.{}d.trimmed.npz".format(dim_word)
     use_pretrained = True
 
     # dataset
-    # filename_dev = "data/coNLL/eng/eng.testa.iob"
-    # filename_test = "data/coNLL/eng/eng.testb.iob"
-    # filename_train = "data/coNLL/eng/eng.train.iob"
+    filename_test = "D:\\NeuroNER\\data\\conll2003\\en_old\\test.txt"
+    filename_train = "D:\\NeuroNER\\data\\conll2003\\en_old\\train.txt"
+    filename_dev = "D:\\NeuroNER\\data\\conll2003\\en_old\\valid.txt"
 
-    filename_dev = filename_test = filename_train = "data/test.txt" # test
+    #filename_test = "D:\\test_set.txt"
+    #filename_dev = "D:\\test_set.txt"
+    #filename_train = "D:\\train_set.txt"
 
     max_iter = None # if not None, max number of examples in Dataset
 
@@ -86,18 +88,23 @@ class Config():
 
     # training
     train_embeddings = False
-    nepochs          = 15
+    nepochs          = 200
     dropout          = 0.5
-    batch_size       = 20
+    batch_size       = 16
     lr_method        = "adam"
     lr               = 0.001
-    lr_decay         = 0.9
-    clip             = -1 # if negative, no clipping
-    nepoch_no_imprv  = 3
+    lr_decay         = 0.99
+    clip             = 5.0 # if negative, no clipping
+    nepoch_no_imprv  = 50
+    lambda_regularization_loss = 0.001
 
-    # model hyperparameters
-    hidden_size_char = 100 # lstm on chars
-    hidden_size_lstm = 300 # lstm on word embeddings
+
+    # recurent layers configuration
+    recurrent_cell_type = "lstm"
+    number_of_layers = 1
+    recurent_dropout = 0.5
+    hidden_size_char = 100
+    hidden_size_lstm = 600
 
     # NOTE: if both chars and crf, only 1.6x slower on GPU
     use_crf = True # if crf, training is 1.7x slower on CPU

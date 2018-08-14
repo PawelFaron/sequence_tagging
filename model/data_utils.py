@@ -59,27 +59,37 @@ class CoNLLDataset(object):
 
     def __iter__(self):
         niter = 0
-        with open(self.filename) as f:
-            words, tags = [], []
+        with open(self.filename, encoding="utf8") as f:
+            words, preprocessed_words, tags = [], [], []
             for line in f:
                 line = line.strip()
                 if (len(line) == 0 or line.startswith("-DOCSTART-")):
-                    if len(words) != 0:
+                    if len(preprocessed_words) != 0:
                         niter += 1
                         if self.max_iter is not None and niter > self.max_iter:
                             break
-                        yield words, tags
-                        words, tags = [], []
+                        yield words, preprocessed_words, tags
+                        words, preprocessed_words, tags = [], [], []
                 else:
                     ls = line.split(' ')
-                    word, tag = ls[0],ls[-1]
+                    word, tag = ls[0], ls[-1]
+                    preprocessed_word = word
                     if self.processing_word is not None:
-                        word = self.processing_word(word)
+                        preprocessed_word = self.processing_word(word)
                     if self.processing_tag is not None:
                         tag = self.processing_tag(tag)
+
                     words += [word]
+                    preprocessed_words += [preprocessed_word]
                     tags += [tag]
 
+    def get_train_data(self):
+        Z, X, Y = [], [], []
+        for (words, preprocessed_words, tags) in self:
+            Z += [words]
+            X += [preprocessed_words]
+            Y += [tags]
+        return (Z, X, Y)
 
     def __len__(self):
         """Iterates once over the corpus to set and store length"""
@@ -105,8 +115,8 @@ def get_vocabs(datasets):
     vocab_words = set()
     vocab_tags = set()
     for dataset in datasets:
-        for words, tags in dataset:
-            vocab_words.update(words)
+        for _, preprocessed_words, tags in dataset:
+            vocab_words.update(preprocessed_words)
             vocab_tags.update(tags)
     print("- done. {} tokens".format(len(vocab_words)))
     return vocab_words, vocab_tags
@@ -116,14 +126,14 @@ def get_char_vocab(dataset):
     """Build char vocabulary from an iterable of datasets objects
 
     Args:
-        dataset: a iterator yielding tuples (sentence, tags)
+        dataset: a iterator yielding tuples (words, preprocessed_words, tags)
 
     Returns:
         a set of all the characters in the dataset
 
     """
     vocab_char = set()
-    for words, _ in dataset:
+    for _, words, _ in dataset:
         for word in words:
             vocab_char.update(word)
 
@@ -141,7 +151,7 @@ def get_glove_vocab(filename):
     """
     print("Building vocab...")
     vocab = set()
-    with open(filename) as f:
+    with open(filename, encoding="utf8") as f:
         for line in f:
             word = line.strip().split(' ')[0]
             vocab.add(word)
@@ -163,7 +173,7 @@ def write_vocab(vocab, filename):
 
     """
     print("Writing vocab...")
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding="utf8") as f:
         for i, word in enumerate(vocab):
             if i != len(vocab) - 1:
                 f.write("{}\n".format(word))
@@ -184,7 +194,7 @@ def load_vocab(filename):
     """
     try:
         d = dict()
-        with open(filename) as f:
+        with open(filename, encoding="utf8") as f:
             for idx, word in enumerate(f):
                 word = word.strip()
                 d[word] = idx
@@ -205,7 +215,7 @@ def export_trimmed_glove_vectors(vocab, glove_filename, trimmed_filename, dim):
 
     """
     embeddings = np.zeros([len(vocab), dim])
-    with open(glove_filename) as f:
+    with open(glove_filename, encoding="utf8") as f:
         for line in f:
             line = line.strip().split(' ')
             word = line[0]
@@ -348,19 +358,20 @@ def minibatches(data, minibatch_size):
         list of tuples
 
     """
-    x_batch, y_batch = [], []
-    for (x, y) in data:
+    x_batch, y_batch, words_batch = [], [], []
+    for (word, x, y) in data:
         if len(x_batch) == minibatch_size:
-            yield x_batch, y_batch
+            yield words_batch, x_batch, y_batch
             x_batch, y_batch = [], []
 
         if type(x[0]) == tuple:
             x = zip(*x)
         x_batch += [x]
         y_batch += [y]
+        words_batch += [word]
 
     if len(x_batch) != 0:
-        yield x_batch, y_batch
+        yield words_batch, x_batch, y_batch
 
 
 def get_chunk_type(tok, idx_to_tag):
@@ -379,12 +390,12 @@ def get_chunk_type(tok, idx_to_tag):
     return tag_class, tag_type
 
 
-def get_chunks(seq, tags):
+def get_chunks(seq, idx_to_tag, tag_to_idx):
     """Given a sequence of tags, group entities and their position
 
     Args:
         seq: [4, 4, 0, 0, ...] sequence of labels
-        tags: dict["O"] = 4
+        idx_to_tag: dict["O"] = 4
 
     Returns:
         list of (chunk_type, chunk_start, chunk_end)
@@ -395,8 +406,7 @@ def get_chunks(seq, tags):
         result = [("PER", 0, 2), ("LOC", 3, 4)]
 
     """
-    default = tags[NONE]
-    idx_to_tag = {idx: tag for tag, idx in tags.items()}
+    default = tag_to_idx[NONE]
     chunks = []
     chunk_type, chunk_start = None, None
     for i, tok in enumerate(seq):

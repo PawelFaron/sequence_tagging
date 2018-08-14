@@ -1,7 +1,9 @@
-import numpy as np
-import os
-import tensorflow as tf
+import itertools
 
+import numpy as np
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score, classification_report
+import tensorflow as tf
+from tensorflow.contrib.rnn import LayerNormBasicLSTMCell
 
 from .data_utils import minibatches, pad_sequences, get_chunks
 from .general_utils import Progbar
@@ -42,24 +44,11 @@ class NERModel(BaseModel):
         # hyper parameters
         self.dropout = tf.placeholder(dtype=tf.float32, shape=[],
                         name="dropout")
-        self.lr = tf.placeholder(dtype=tf.float32, shape=[],
-                        name="lr")
+        self.recurent_dropout = tf.placeholder(dtype=tf.float32, shape=[],
+                        name="recurent_dropout")
 
-
-    def get_feed_dict(self, words, labels=None, lr=None, dropout=None):
-        """Given some data, pad it and build a feed dictionary
-
-        Args:
-            words: list of sentences. A sentence is a list of ids of a list of
-                words. A word is a list of ids
-            labels: list of ids
-            lr: (float) learning rate
-            dropout: (float) keep prob
-
-        Returns:
-            dict {placeholder: value}
-
-        """
+    def get_feed_dict(self, words, labels=None,
+                      dropout=1.0, recurent_dropout=1.0):
         # perform padding of the given data
         if self.config.use_chars:
             char_ids, word_ids = zip(*words)
@@ -83,23 +72,34 @@ class NERModel(BaseModel):
             labels, _ = pad_sequences(labels, 0)
             feed[self.labels] = labels
 
-        if lr is not None:
-            feed[self.lr] = lr
-
-        if dropout is not None:
-            feed[self.dropout] = dropout
+        feed[self.dropout] = dropout
+        feed[self.recurent_dropout] = recurent_dropout
 
         return feed, sequence_lengths
 
+    def get_recurrent_cell(self, num_units):
+        if self.config.recurrent_cell_type is "norm_lstm":
+            return lambda: LayerNormBasicLSTMCell(num_units=num_units, dropout_keep_prob=self.recurent_dropout)
+        elif self.config.recurrent_cell_type is "lstm":
+            return lambda: tf.nn.rnn_cell.LSTMCell(num_units=num_units)
+        else:
+            raise ValueError("Incorrect cell_type '" + str(self.config.cell_type) + "'")
+
+    def add_dropout(self, cell, input_size):
+        if self.config.recurrent_cell_type is "lstm":
+            return tf.contrib.rnn.DropoutWrapper(cell=cell,
+                                                 input_keep_prob=self.dropout,
+                                                 output_keep_prob=self.dropout,
+                                                 state_keep_prob=self.dropout,
+                                                 variational_recurrent=True,
+                                                 input_size=input_size,
+                                                 dtype=tf.float32)
+        else:
+            return tf.contrib.rnn.DropoutWrapper(cell=cell,
+                                                 input_keep_prob=self.dropout,
+                                                 output_keep_prob=self.dropout)
 
     def add_word_embeddings_op(self):
-        """Defines self.word_embeddings
-
-        If self.config.embeddings is not None and is a np array initialized
-        with pre-trained word vectors, the word embeddings is just a look-up
-        and we don't train the vectors. Otherwise, a random matrix with
-        the correct shape is initialized.
-        """
         with tf.variable_scope("words"):
             if self.config.embeddings is None:
                 self.logger.info("WARNING: randomly initializing word vectors")
@@ -114,12 +114,11 @@ class NERModel(BaseModel):
                         dtype=tf.float32,
                         trainable=self.config.train_embeddings)
 
-            word_embeddings = tf.nn.embedding_lookup(_word_embeddings,
+            self.word_embeddings = tf.nn.embedding_lookup(_word_embeddings,
                     self.word_ids, name="word_embeddings")
 
         with tf.variable_scope("chars"):
             if self.config.use_chars:
-                # get char embeddings matrix
                 _char_embeddings = tf.get_variable(
                         name="_char_embeddings",
                         dtype=tf.float32,
@@ -133,11 +132,14 @@ class NERModel(BaseModel):
                         shape=[s[0]*s[1], s[-2], self.config.dim_char])
                 word_lengths = tf.reshape(self.word_lengths, shape=[s[0]*s[1]])
 
-                # bi lstm on chars
-                cell_fw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_char,
-                        state_is_tuple=True)
-                cell_bw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_char,
-                        state_is_tuple=True)
+                cell_creator = self.get_recurrent_cell(self.config.hidden_size_char)
+
+                cell_fw = cell_creator()
+                cell_bw = cell_creator()
+
+                cell_fw = self.add_dropout(cell_fw, self.config.dim_char)
+                cell_bw = self.add_dropout(cell_bw, self.config.dim_char)
+
                 _output = tf.nn.bidirectional_dynamic_rnn(
                         cell_fw, cell_bw, char_embeddings,
                         sequence_length=word_lengths, dtype=tf.float32)
@@ -149,55 +151,50 @@ class NERModel(BaseModel):
                 # shape = (batch size, max sentence length, char hidden size)
                 output = tf.reshape(output,
                         shape=[s[0], s[1], 2*self.config.hidden_size_char])
-                word_embeddings = tf.concat([word_embeddings, output], axis=-1)
-
-        self.word_embeddings =  tf.nn.dropout(word_embeddings, self.dropout)
-
+                self.word_embeddings = tf.concat([self.word_embeddings, output], axis=-1)
 
     def add_logits_op(self):
-        """Defines self.logits
-
-        For each word in each sentence of the batch, it corresponds to a vector
-        of scores, of dimension equal to the number of tags.
-        """
         with tf.variable_scope("bi-lstm"):
-            cell_fw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_lstm)
-            cell_bw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_lstm)
-            (output_fw, output_bw), _ = tf.nn.bidirectional_dynamic_rnn(
-                    cell_fw, cell_bw, self.word_embeddings,
-                    sequence_length=self.sequence_lengths, dtype=tf.float32)
-            output = tf.concat([output_fw, output_bw], axis=-1)
-            output = tf.nn.dropout(output, self.dropout)
+            cell_creator = self.get_recurrent_cell(self.config.hidden_size_lstm)
+
+            cells_fw = [cell_creator() for _ in range(self.config.number_of_layers)]
+            cells_bw = [cell_creator() for _ in range(self.config.number_of_layers)]
+
+            dropout_input_size = self.config.dim_word
+            if self.config.use_chars:
+                dropout_input_size += self.config.hidden_size_char * 2
+
+            cells_fw[0] = self.add_dropout(cells_fw[0], dropout_input_size)
+            cells_bw[0] = self.add_dropout(cells_bw[0], dropout_input_size)
+
+            for layer in range(1, self.config.number_of_layers):
+                dropout_input_size = self.config.hidden_size_lstm * 2
+                cells_fw[layer] = self.add_dropout(cells_fw[layer], dropout_input_size)
+                cells_bw[layer] = self.add_dropout(cells_bw[layer], dropout_input_size)
+
+            output, _, _ = tf.contrib.rnn.stack_bidirectional_dynamic_rnn(
+                cells_fw=cells_fw,
+                cells_bw=cells_bw,
+                inputs=self.word_embeddings,
+                sequence_length=self.sequence_lengths,
+                dtype=tf.float32)
 
         with tf.variable_scope("proj"):
-            W = tf.get_variable("W", dtype=tf.float32,
-                    shape=[2*self.config.hidden_size_lstm, self.config.ntags])
-
-            b = tf.get_variable("b", shape=[self.config.ntags],
-                    dtype=tf.float32, initializer=tf.zeros_initializer())
-
             nsteps = tf.shape(output)[1]
-            output = tf.reshape(output, [-1, 2*self.config.hidden_size_lstm])
-            pred = tf.matmul(output, W) + b
+            output = tf.reshape(output, [-1, 2 * self.config.hidden_size_lstm])
+            pred = tf.layers.dense(output, self.config.ntags)
             self.logits = tf.reshape(pred, [-1, nsteps, self.config.ntags])
 
-
     def add_pred_op(self):
-        """Defines self.labels_pred
-
-        This op is defined only in the case where we don't use a CRF since in
-        that case we can make the prediction "in the graph" (thanks to tf
-        functions in other words). With theCRF, as the inference is coded
-        in python and not in pure tensroflow, we have to make the prediciton
-        outside the graph.
-        """
-        if not self.config.use_crf:
-            self.labels_pred = tf.cast(tf.argmax(self.logits, axis=-1),
-                    tf.int32)
-
+        if self.config.use_crf:
+            self.labels_pred, self.viterbi_score = tf.contrib.crf.crf_decode(
+                self.logits, self.trans_params, self.sequence_lengths)
+        else:
+            self.labels_pred = tf.cast(tf.argmax(self.logits, axis=-1), tf.int32)
 
     def add_loss_op(self):
-        """Defines the loss"""
+        self.sample_weight = tf.placeholder(dtype=tf.float32, shape=[None, None],
+                                            name='sample_weights')
         if self.config.use_crf:
             log_likelihood, trans_params = tf.contrib.crf.crf_log_likelihood(
                     self.logits, self.labels, self.sequence_lengths)
@@ -210,21 +207,34 @@ class NERModel(BaseModel):
             losses = tf.boolean_mask(losses, mask)
             self.loss = tf.reduce_mean(losses)
 
+        if self.config.lambda_regularization_loss > 0.0:
+            self.loss += self.get_l2_regularization()
+
         # for tensorboard
         tf.summary.scalar("loss", self.loss)
 
+
+    def get_l2_regularization(self):
+        for unreg in [tf_var.name for tf_var in tf.trainable_variables()
+                      if ("bias" in tf_var.name.lower())]:
+            print(unreg)
+
+        l2 = self.config.lambda_regularization_loss * sum(tf.nn.l2_loss(tf_var)
+            for tf_var in tf.trainable_variables() if not ("bias" in tf_var.name.lower())
+        )
+
+        return l2
 
     def build(self):
         # NER specific functions
         self.add_placeholders()
         self.add_word_embeddings_op()
         self.add_logits_op()
-        self.add_pred_op()
         self.add_loss_op()
+        self.add_pred_op()
 
         # Generic functions that add training op and initialize session
-        self.add_train_op(self.config.lr_method, self.lr, self.loss,
-                self.config.clip)
+        self.add_train_op(self.config.lr_method, self.loss, self.config.clip)
         self.initialize_session() # now self.sess is defined and vars are init
 
 
@@ -238,27 +248,10 @@ class NERModel(BaseModel):
             sequence_length
 
         """
-        fd, sequence_lengths = self.get_feed_dict(words, dropout=1.0)
+        fd, sequence_lengths = self.get_feed_dict(words)
+        labels_pred = self.sess.run(self.labels_pred, feed_dict=fd)
 
-        if self.config.use_crf:
-            # get tag scores and transition params of CRF
-            viterbi_sequences = []
-            logits, trans_params = self.sess.run(
-                    [self.logits, self.trans_params], feed_dict=fd)
-
-            # iterate over the sentences because no batching in vitervi_decode
-            for logit, sequence_length in zip(logits, sequence_lengths):
-                logit = logit[:sequence_length] # keep only the valid steps
-                viterbi_seq, viterbi_score = tf.contrib.crf.viterbi_decode(
-                        logit, trans_params)
-                viterbi_sequences += [viterbi_seq]
-
-            return viterbi_sequences, sequence_lengths
-
-        else:
-            labels_pred = self.sess.run(self.labels_pred, feed_dict=fd)
-
-            return labels_pred, sequence_lengths
+        return labels_pred, sequence_lengths
 
 
     def run_epoch(self, train, dev, epoch):
@@ -279,74 +272,102 @@ class NERModel(BaseModel):
         prog = Progbar(target=nbatches)
 
         # iterate over dataset
-        for i, (words, labels) in enumerate(minibatches(train, batch_size)):
-            fd, _ = self.get_feed_dict(words, labels, self.config.lr,
-                    self.config.dropout)
+        for i, (_, words_indexes, labels) in enumerate(minibatches(train, batch_size)):
+            fd, _ = self.get_feed_dict(words_indexes, labels,
+                    self.config.dropout, self.config.recurent_dropout)
 
-            _, train_loss, summary = self.sess.run(
-                    [self.train_op, self.loss, self.merged], feed_dict=fd)
+            _, train_loss, summary, learning_rate = self.sess.run(
+                    [self.train_op, self.loss, self.merged, self.learning_rate], feed_dict=fd)
 
-            prog.update(i + 1, [("train loss", train_loss)])
+            prog.update(i + 1, [("train loss", train_loss), ("learning rate", learning_rate)])
 
             # tensorboard
             if i % 10 == 0:
                 self.file_writer.add_summary(summary, epoch*nbatches + i)
 
-        metrics = self.run_evaluate(dev)
+        dev_metrics = self.run_evaluate(dev)
         msg = " - ".join(["{} {:04.2f}".format(k, v)
-                for k, v in metrics.items()])
-        self.logger.info(msg)
+                for k, v in dev_metrics.items()])
 
-        return metrics["f1"]
+        train_metrics2 = self.run_evaluate(train)
+        msg2 = " - ".join(["{} {:04.2f}".format(k, v)
+                for k, v in train_metrics2.items()])
 
+        self.logger.info("train: " + msg2 + " dev: " + msg)
 
-    def run_evaluate(self, test):
-        """Evaluates performance on test set
+        return dev_metrics["f1"]
 
-        Args:
-            test: dataset that yields tuple of (sentences, tags)
+    def print_statistics(self, precision, recall, fscore, idx2Label):
+        width = 20
+        print("")
+        print('{:<{width}} {:<{width}} {:<{width}} {:<{width}}'.format(
+            "Label", "Precission", "Recall", "F1", width=width)
+        )
+        for i in range(len(precision)):
+            print('{:<{width}} {:<{width}.2f} {:<{width}.2f} {:<{width}.2f}'.format(
+                idx2Label[i].strip(), precision[i], recall[i], fscore[i], width=width)
+            )
 
-        Returns:
-            metrics: (dict) metrics["acc"] = 98.4, ...
+    def calculate_statistics(self, labels, predictions):
+        precision, recall, fscore, support = precision_recall_fscore_support(
+            y_true=labels,
+            y_pred=predictions,
+        )
 
-        """
-        accs = []
-        correct_preds, total_correct, total_preds = 0., 0., 0.
-        for words, labels in minibatches(test, self.config.batch_size):
-            labels_pred, sequence_lengths = self.predict_batch(words)
+        return precision, recall, fscore
 
-            for lab, lab_pred, length in zip(labels, labels_pred,
+    def convert_labels_to_array(self, labels, predictions, sequence_lengths):
+        predictions2 = []
+        for prediction, length in zip(predictions, sequence_lengths):
+            predictions2.append(prediction[:length])
+
+        labels = list(itertools.chain.from_iterable(labels))
+        predictions = list(itertools.chain.from_iterable(predictions2))
+
+        return (labels, predictions)
+
+    def predict_labels(self, data):
+        for words, words_indexes, labels in minibatches(data, self.config.batch_size):
+            labels_pred, sequence_lengths = self.predict_batch(words_indexes)
+
+            for lab, lab_pred, word, length  in zip(labels, labels_pred, words,
                                              sequence_lengths):
                 lab      = lab[:length]
                 lab_pred = lab_pred[:length]
-                accs    += [a==b for (a, b) in zip(lab, lab_pred)]
 
-                lab_chunks      = set(get_chunks(lab, self.config.vocab_tags))
-                lab_pred_chunks = set(get_chunks(lab_pred,
-                                                 self.config.vocab_tags))
+                lab_chunks      = set(get_chunks(lab, self.idx_to_tag, self.config.vocab_tags))
+                lab_pred_chunks = set(get_chunks(lab_pred, self.idx_to_tag, self.config.vocab_tags))
 
-                correct_preds += len(lab_chunks & lab_pred_chunks)
-                total_preds   += len(lab_pred_chunks)
-                total_correct += len(lab_chunks)
+        return (lab_chunks, lab_pred_chunks)
 
-        p   = correct_preds / total_preds if correct_preds > 0 else 0
-        r   = correct_preds / total_correct if correct_preds > 0 else 0
-        f1  = 2 * p * r / (p + r) if correct_preds > 0 else 0
-        acc = np.mean(accs)
+    def run_evaluate(self, test):
+        all_predictions = []
+        all_labels = []
+        all_sequence_lengths = []
 
-        return {"acc": 100*acc, "f1": 100*f1}
+        for words, words_indexes, labels in minibatches(test, self.config.batch_size):
+            labels_pred, sequence_lengths = self.predict_batch(words_indexes)
+            all_predictions.extend(labels_pred)
+            all_labels.extend(labels)
+            all_sequence_lengths.extend(sequence_lengths)
+
+        labels, predictions = self.convert_labels_to_array(all_labels, all_predictions, all_sequence_lengths)
+        precision, recall, f1score = self.calculate_statistics(labels, predictions)
+
+        precision = list(precision)
+        recall = list(recall)
+        f1score = list(f1score)
+
+        for score in (precision, recall, f1score):
+            del score[self.config.vocab_tags["O"]]
+
+        accuracy = accuracy_score(labels, predictions)
+        self.print_statistics(precision, recall, f1score, self.idx_to_tag)
+
+        return {"f1": np.mean(f1score) * 100, "acc": accuracy * 100}
 
 
     def predict(self, words_raw):
-        """Returns list of tags
-
-        Args:
-            words_raw: list of words (string), just one sentence (no batch)
-
-        Returns:
-            preds: list of tags (string), one for each word in the sentence
-
-        """
         words = [self.config.processing_word(w) for w in words_raw]
         if type(words[0]) == tuple:
             words = zip(*words)
